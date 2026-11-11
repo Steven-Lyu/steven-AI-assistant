@@ -18,8 +18,10 @@ export async function directoryIdentity(directory) {
     if (s.isSymbolicLink() || !s.isDirectory()) throw new Error('Choose a regular folder without links or junctions in its path.');
     if (part === path.dirname(part)) break;
   }
+  // realpath resolves symlinks AND Windows junctions to their targets, so a link
+  // anywhere in the path (including an ancestor) makes the canonical path differ.
   const canonical = await realpath(resolved);
-  if (path.relative(resolved, canonical) !== '') throw new Error('Linked folder paths are not supported.');
+  if (path.relative(resolved, canonical) !== '') throw new Error('Choose a regular folder without links or junctions in its path.');
   return identity(await lstat(resolved));
 }
 export async function scanFolder(directory) {
@@ -27,9 +29,13 @@ export async function scanFolder(directory) {
   if (root === path.parse(root).root) throw new Error('Choose a folder, not an entire drive.');
   const rootIdentity = await directoryIdentity(root);
   const files = [], skipped = [];
-  for (const name of (await readdir(root)).sort()) {
+  const entries = (await readdir(root, { withFileTypes: true })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) {
+    const name = entry.name;
     const s = await lstat(path.join(root, name));
-    const reason = s.isSymbolicLink() ? 'Link or junction' : s.isDirectory() ? 'Subfolder' : !s.isFile() ? 'Not a regular file' : s.nlink > 1 ? 'Hard-linked file' : name.startsWith('.') ? 'Dotfile' : !safeName(name) ? 'Unsupported file name' : null;
+    // Stats.isSymbolicLink() is false for Windows junctions (mount points), but
+    // Dirent.isSymbolicLink() is true for both junctions and symlinks.
+    const reason = (entry.isSymbolicLink() || s.isSymbolicLink()) ? 'Link or junction' : s.isDirectory() ? 'Subfolder' : !s.isFile() ? 'Not a regular file' : s.nlink > 1 ? 'Hard-linked file' : name.startsWith('.') ? 'Dotfile' : !safeName(name) ? 'Unsupported file name' : null;
     if (reason) skipped.push({ name, reason });
     else files.push({ name, ...metadata(s) });
   }

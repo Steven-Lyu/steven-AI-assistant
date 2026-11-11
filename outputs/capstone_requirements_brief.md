@@ -9,6 +9,8 @@
 
 **进展与下一步（2026-11-11）：**受控 sample 文件已能通过现有 GUI、Codex 分类和业务确认流程正常整理，用户希望下一步处理电脑上的真实文件。用户选择由 GUI 的 **Browse** 按钮调用本地应用服务，打开 Windows 系统 **Choose folder** 窗口；服务取得用户选中的文件夹路径后扫描并展示预览。此功能现已实现；原生选择器、扫描预览、所选目录内分类、重新校验及部分失败报告已接入。测试与浏览器验收范围见 `real_folder_verification.md`。
 
+**进展更新（2026-11-11）：**真实文件夹的 junction 检测 bug 已修复并验证：Windows junction 此前被 Node `lstat().isSymbolicLink()` 误判为普通目录，导致跳过标签错误、报错消息不符且对应测试失败；现已改用 `readdir({ withFileTypes: true })` 的 `Dirent.isSymbolicLink()` 识别链接。实现边界（跳过子目录、符号链接/junction、硬链接、点文件）不变，细节见 `real_folder_verification.md`。
+
 ## 1. 课题原文与目标
 
 导师提供的 capstone topic：
