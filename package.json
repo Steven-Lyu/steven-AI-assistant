@@ -1,0 +1,6 @@
+{
+  "name": "capstone-assistant", "version": "0.1.0", "private": true, "type": "module",
+  "description": "Local AI personal assistant powered by Codex app-server",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node server/index.js", "dev": "node --watch server/index.js", "test": "node --test", "check:codex": "node scripts/check-codex.js" }
+}

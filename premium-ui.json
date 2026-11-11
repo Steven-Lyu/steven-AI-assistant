@@ -1,0 +1,10 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["public"],
+  "locale": "en-GB",
+  "canonicalMap": "UX-CONTRACT.md",
+  "requiredCapabilities": ["Form", "Scrollbar", "Toast", "CRUD"],
+  "commands": { "unit": "npm test" },
+  "requiredCommands": ["unit"],
+  "evidence": { "crudFullFlow": "outputs/milestone1_implementation.md", "failurePaths": "test/tasks.test.js" }
+}
