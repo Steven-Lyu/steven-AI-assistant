@@ -51,3 +51,8 @@ Figma connector discovery confirmed that design-system reads require a file key.
 ## Remaining boundaries
 
 No external calendar/email integration added. No real permission request was triggered during this UI task; existing permission lifecycle unit tests pass. This is not a full automated accessibility or cross-browser certification. Current account usage availability may prevent new real-model tasks until its allowance resets.
+
+
+## Planning cancellation repair — 2026-11-11
+
+Cancel task is now a stable control above the task body, outside streamed HTML replacement. Real browser checks on port 4311 covered planning, cancel during a live model turn, cancel at review, new planning after cancel and keyboard cancellation. The task stages now distinguish checking, connecting, starting, planning, retrying and cancelling, with truthful elapsed time and bounded failures. At 375px, document scroll width was 365px. Screenshot: `ui-cancel-fixed.png`. Detailed diagnostics and 28 passing tests are recorded in `real_folder_verification.md`.

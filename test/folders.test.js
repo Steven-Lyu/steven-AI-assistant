@@ -23,5 +23,12 @@ test('selection IDs are required and rescan replaces the capability and inventor
   const next = await service.rescan(first.id);
   assert.equal(next.files.length, 1); assert.notEqual(next.id, first.id);
   assert.throws(() => service.get(first.id), /expired/);
-  assert.deepEqual(Object.keys(next.files[0]), ['name','size']);
+  assert.deepEqual(Object.keys(next.files[0]), ['relativePath','name','size']);
+});
+
+test('scope changes invalidate previous selection and bind a fresh recursive inventory', async t => {
+  await mkdir('work/tests',{recursive:true});const root=await mkdtemp(path.resolve('work/tests/scope-'));
+  t.after(()=>rm(root,{recursive:true,force:true}));await mkdir(path.join(root,'nested'));await writeFile(path.join(root,'nested','notes.txt'),'x');
+  const service=new FolderService(async()=>root),first=await service.browse();assert.equal(first.firstLevelOnly,true);assert.equal(first.files.length,0);
+  const next=await service.rescan(first.id,false);assert.equal(next.firstLevelOnly,false);assert.equal(next.files[0].relativePath,'nested/notes.txt');assert.throws(()=>service.get(first.id),/expired/);
 });

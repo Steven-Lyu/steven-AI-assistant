@@ -1,13 +1,19 @@
-import { mkdir, writeFile, readdir, lstat, realpath, open, link, unlink } from 'node:fs/promises';
+import { mkdir, writeFile, readdir, lstat, realpath, open } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { inspectOutput, assertSourceFolder } from './organization.js';
+import { offlineFiles } from './windows-attributes.js';
 
-export const categories = ['Study', 'Work', 'Life', 'Other'];
 export const MAX_FILES = 200;
-const identity = s => ({ dev: s.dev, ino: s.ino, birthtimeMs: s.birthtimeMs });
-const metadata = s => ({ ...identity(s), size: s.size, mtimeMs: s.mtimeMs, ctimeMs: s.ctimeMs });
-const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+export const identity = s => ({ dev: s.dev, ino: s.ino, birthtimeMs: s.birthtimeMs });
+export const metadata = s => ({ ...identity(s), size: s.size, mtimeMs: s.mtimeMs, ctimeMs: s.ctimeMs });
+export const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const safeName = name => typeof name === 'string' && name !== '.' && name !== '..' && !/[\\/:\0]/.test(name) && !/[. ]$/.test(name);
+// A category is a single child folder, not an arbitrary path from the model.
+// Windows device names and characters are rejected even when tests run elsewhere.
+export const safeCategory = name => safeName(name) && name.length > 0 && name.length <= 255 && name.trim() === name &&
+  !/[<>"|?*\x00-\x1f\x7f]/.test(name) &&
+  !/^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name);
 const changed = () => new Error('Files have changed. Rescan the folder and make a new plan.');
 
 // Check every path component: a junction in an ancestor is also outside our boundary.
@@ -24,45 +30,96 @@ export async function directoryIdentity(directory) {
   if (path.relative(resolved, canonical) !== '') throw new Error('Choose a regular folder without links or junctions in its path.');
   return identity(await lstat(resolved));
 }
-export async function scanFolder(directory) {
-  const root = path.resolve(directory);
-  if (root === path.parse(root).root) throw new Error('Choose a folder, not an entire drive.');
-  const rootIdentity = await directoryIdentity(root);
-  const files = [], skipped = [];
-  const entries = (await readdir(root, { withFileTypes: true })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  for (const entry of entries) {
-    const name = entry.name;
-    const s = await lstat(path.join(root, name));
-    // Stats.isSymbolicLink() is false for Windows junctions (mount points), but
-    // Dirent.isSymbolicLink() is true for both junctions and symlinks.
-    const reason = (entry.isSymbolicLink() || s.isSymbolicLink()) ? 'Link or junction' : s.isDirectory() ? 'Subfolder' : !s.isFile() ? 'Not a regular file' : s.nlink > 1 ? 'Hard-linked file' : name.startsWith('.') ? 'Dotfile' : !safeName(name) ? 'Unsupported file name' : null;
-    if (reason) skipped.push({ name, reason });
-    else files.push({ name, ...metadata(s) });
-  }
-  if (files.length > MAX_FILES) throw new Error(`This version supports up to ${MAX_FILES} files per folder. Choose a smaller folder.`);
-  if (!equal(await directoryIdentity(root), rootIdentity)) throw changed();
-  return { root, rootIdentity, files, skipped };
+export const SCAN_LIMITS = { depth: 8, files: 200, directories: 1000, entries: 10000, milliseconds: 30000 };
+export const fileKey = file => file.relativePath ?? file.name;
+export const safeRelative = value => typeof value === 'string' && value.length > 0 && value.split('/').every(safeCategory) && !value.includes('\\');
+export function inside(root, relative) {
+  if (!safeRelative(relative)) throw new Error('Invalid relative file path');
+  const resolved = path.resolve(root, ...relative.split('/'));
+  if (!path.relative(root, resolved) || path.relative(root, resolved).startsWith('..') || path.isAbsolute(path.relative(root, resolved))) throw new Error('Path leaves the selected folder');
+  return resolved;
 }
-export async function hashFile(file, expected) {
+export async function scanFolder(directory, { firstLevelOnly = true, signal, onProgress, limits = SCAN_LIMITS } = {}) {
+  const root = path.resolve(directory);
+  if (typeof firstLevelOnly !== 'boolean') throw new Error('Invalid scanning scope');
+  if (root === path.parse(root).root) throw new Error('Choose a folder, not an entire drive.');
+  await assertSourceFolder(root);
+  const rootIdentity = await directoryIdentity(root), output = await inspectOutput(root);
+  const files = [], skipped = [], directories = [], unscanned = [];
+  const deadline = Date.now() + limits.milliseconds;
+  let entriesSeen = 0;
+  const check = () => { signal?.throwIfAborted(); if (Date.now() > deadline) throw new Error('Scan time limit reached'); };
+  async function walk(relative = '', depth = 0) {
+    const dir = relative ? inside(root, relative) : root;
+    try {
+      check();
+      if (depth > limits.depth || directories.length >= limits.directories) throw new Error('Scan depth or folder limit reached');
+      const before = await directoryIdentity(dir);
+      const entries = (await readdir(dir, { withFileTypes: true })).sort((a,b)=>a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      onProgress?.({files:files.length,directories:directories.length+1,current:relative||'.'});
+      directories.push({ relativePath: relative, identity: before, entries: entries.map(e=>e.name) });
+      const project = entries.some(e => ['.git','package.json','pyproject.toml','Cargo.toml','go.mod','.sln'].includes(e.name) || e.name.endsWith('.sln'));
+      if (project) { skipped.push({ name: relative || '.', relativePath: relative || '.', reason: 'Linked project files — keep this folder together' }); return; }
+      for (const entry of entries) {
+        check();
+        if (++entriesSeen > limits.entries) throw new Error('Scan entry limit reached');
+        const rel = relative ? relative + '/' + entry.name : entry.name;
+        if (!relative && entry.name.toLowerCase() === 'organized') {
+          skipped.push({ name: entry.name, relativePath: rel, reason: output.exists ? 'Managed output folder' : 'Output folder conflict' }); continue;
+        }
+        if (entry.isSymbolicLink()) { skipped.push({ name: entry.name, relativePath: rel, reason: 'Link or junction' }); continue; }
+        if (entry.name.startsWith('.')) { skipped.push({ name: entry.name, relativePath: rel, reason: entry.isDirectory() ? 'Dotfolder' : 'Dotfile' }); continue; }
+        if (!safeCategory(entry.name)) { skipped.push({ name: entry.name, relativePath: rel, reason: 'Unsupported file name' }); continue; }
+        if (entry.isDirectory()) {
+          if (firstLevelOnly) skipped.push({ name: entry.name, relativePath: rel, reason: 'Subfolder — outside selected scope' });
+          else if (/_files$|_assets$/i.test(entry.name)) skipped.push({ name: entry.name, relativePath: rel, reason: 'Web resources — keep related files together' });
+          else await walk(rel, depth + 1);
+          continue;
+        }
+        const s = await lstat(inside(root, rel));
+        const reason = s.isSymbolicLink() ? 'Link or junction' : !s.isFile() ? 'Not a regular file' : s.nlink > 1 ? 'Hard-linked file' : /\.(html?|css|js|mjs|cjs)$/i.test(entry.name) ? 'Potential linked resources — keep related files together' : null;
+        if (reason) skipped.push({ name: entry.name, relativePath: rel, reason });
+        else { if (files.length >= limits.files) throw new Error('Scan file limit reached (up to ' + limits.files + ' files)'); files.push({ name: entry.name, relativePath: rel, ...metadata(s) }); }
+        onProgress?.({ files: files.length, directories: directories.length, current: rel });
+      }
+      if (!equal(before, await directoryIdentity(dir))) throw changed();
+    } catch (e) { if (signal?.aborted) throw e; unscanned.push({ relativePath: relative || '.', reason: e.message }); }
+  }
+  await walk(); signal?.throwIfAborted();
+  const offline = await offlineFiles(files.map(f=>inside(root, f.relativePath)), signal);
+  const eligible = files.filter(f => { if (!offline.has(inside(root,f.relativePath))) return true; skipped.push({ name:f.name,relativePath:f.relativePath,reason:'Cloud placeholder or offline file — not downloaded' }); return false; });
+  if (!equal(await directoryIdentity(root), rootIdentity)) throw changed();
+  return { root, rootIdentity, firstLevelOnly, files: eligible, skipped, directories, unscanned, complete: !unscanned.length, output, limits };
+}
+export async function hashFile(file, expected, { signal } = {}) {
+  signal?.throwIfAborted();
   const before = await lstat(file);
   if (!before.isFile() || before.isSymbolicLink() || !equal(metadata(before), metadata(expected))) throw changed();
   const handle = await open(file, 'r');
   try {
     if (!equal(metadata(await handle.stat()), metadata(before))) throw changed();
     const hash = createHash('sha256');
-    for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk);
+    for await (const chunk of handle.createReadStream({ autoClose: false, signal })) { signal?.throwIfAborted(); hash.update(chunk); }
     if (!equal(metadata(await handle.stat()), metadata(before)) || !equal(metadata(await lstat(file)), metadata(before))) throw changed();
     return hash.digest('hex');
   } finally { await handle.close(); }
 }
-export async function prepareInventory(selection) {
-  const current = await scanFolder(selection.root);
-  if (!equal(current.rootIdentity, selection.rootIdentity) || !equal(current.files, selection.files)) throw changed();
+export async function prepareInventory(selection, { signal, onProgress } = {}) {
+  signal?.throwIfAborted();
+  if (!selection.complete) throw new Error('Scan is incomplete. Choose a smaller accessible folder and rescan.');
+  const current = await scanFolder(selection.root, { firstLevelOnly: selection.firstLevelOnly, signal });
+  if (!current.complete || !equal(current.rootIdentity, selection.rootIdentity) || !equal(current.files, selection.files) || !equal(current.directories, selection.directories)) throw changed();
   const files = [];
-  for (const file of current.files) files.push({ ...file, hash: await hashFile(path.join(current.root, file.name), file) });
+  for (const file of current.files) {
+    signal?.throwIfAborted();
+    files.push({ ...file, hash: await hashFile(inside(current.root, file.relativePath), file, { signal }) });
+    onProgress?.({ completed: files.length, total: current.files.length });
+  }
+  const final = await scanFolder(selection.root,{firstLevelOnly:selection.firstLevelOnly,signal});
+  if(!final.complete || !equal(final.files,current.files) || !equal(final.directories,current.directories))throw changed();
   return files;
 }
-export async function seed(root) {
+export async function seed(root, { firstLevelOnly = true } = {}) {
   await mkdir(path.join(root, 'Inbox'), { recursive: true });
   const samples = {
     'Capstone notes.txt': 'AI Personal Assistant: interface, motion and task workflows.\n',
@@ -73,80 +130,11 @@ export async function seed(root) {
     'Shopping list.md': '# Shopping list\nMilk, fruit.\n'
   };
   for (const [name, content] of Object.entries(samples)) await writeFile(path.join(root, 'Inbox', name), content, { flag: 'wx' });
-  return snapshot(root);
-}
-export async function snapshot(root) { return prepareInventory(await scanFolder(path.join(root, 'Inbox'))); }
-export const planSchema = {
-  type: 'object', additionalProperties: false, required: ['summary', 'moves'],
-  properties: { summary: { type: 'string' }, moves: { type: 'array', items: {
-    type: 'object', additionalProperties: false, required: ['name', 'category', 'reason'],
-    properties: { name: { type: 'string' }, category: { type: 'string', enum: categories }, reason: { type: 'string' } }
-  } } }
-};
-export function validatePlan(plan, files) {
-  if (!plan || typeof plan.summary !== 'string' || !Array.isArray(plan.moves) || !files.length || plan.moves.length !== files.length) throw new Error('Codex returned an incomplete plan. Please try again');
-  const names = new Set(files.map(f => f.name));
-  for (const move of plan.moves) {
-    if (!move || !safeName(move.name) || !names.delete(move.name) || !categories.includes(move.category) || typeof move.reason !== 'string') throw new Error('The plan contains duplicate files, unknown files or invalid folders');
+  for (const folder of ['Course A', 'Course B']) {
+    await mkdir(path.join(root,'Inbox',folder));
+    await writeFile(path.join(root,'Inbox',folder,'IELTS Reading.txt'),'Sample reading notes from '+folder,{flag:'wx'});
   }
-  return plan;
+  return snapshot(root, { firstLevelOnly });
 }
-async function absent(file) {
-  try { await lstat(file); } catch (e) { if (e.code === 'ENOENT') return; throw e; }
-  throw new Error(`Destination already exists: ${file}. Nothing will be overwritten.`);
-}
-// No speculative rollback: on failure retain completed moves and report the exact receipt.
-// Exclusive hard-link + unlink preserves file data/metadata and never overwrites a target.
-// Unsupported filesystems fail safely; there is deliberately no copy/delete fallback.
-export async function executePlan(root, plan, original, source = null) {
-  const sourceRoot = source?.root || path.join(root, 'Inbox');
-  const expectedRoot = source?.rootIdentity || await directoryIdentity(sourceRoot);
-  const targetIdentity = await directoryIdentity(root);
-  const receipt = { completed: [], notMoved: [...plan.moves], needsReview: [] };
-  try {
-    validatePlan(plan, original);
-    const fresh = await scanFolder(sourceRoot);
-    if (!equal(fresh.rootIdentity, expectedRoot)) throw changed();
-    const current = await prepareInventory(fresh);
-    if (!equal(current, original)) throw changed();
-    const folderIdentities = new Map();
-    // Preflight every destination before moving even the first file.
-    for (const category of new Set(plan.moves.map(m => m.category))) {
-      const folder = path.join(root, category);
-      try { folderIdentities.set(category, await directoryIdentity(folder)); }
-      catch (e) { if (e.code !== 'ENOENT') throw e; }
-    }
-    for (const move of plan.moves) await absent(path.join(root, move.category, move.name));
-    for (const category of new Set(plan.moves.map(m => m.category))) {
-      if (!equal(await directoryIdentity(root), targetIdentity)) throw changed();
-      const folder = path.join(root, category);
-      if (!folderIdentities.has(category)) {
-        await mkdir(folder); // EEXIST is a concurrent change, not permission to reuse it.
-        folderIdentities.set(category, await directoryIdentity(folder));
-      }
-    }
-    for (const move of plan.moves) {
-      const checkFolders = async () => {
-        if (!equal(await directoryIdentity(sourceRoot), expectedRoot) || !equal(await directoryIdentity(root), targetIdentity) || !equal(await directoryIdentity(path.join(root, move.category)), folderIdentities.get(move.category))) throw changed();
-      };
-      await checkFolders();
-      const file = original.find(f => f.name === move.name);
-      const from = path.join(sourceRoot, move.name), to = path.join(root, move.category, move.name);
-      if (await hashFile(from, file) !== file.hash) throw changed();
-      await link(from, to); // Exclusive creation, same filesystem. Existing targets are never replaced.
-      receipt.needsReview.push(move);
-      await checkFolders();
-      const linked = await lstat(from), target = await lstat(to);
-      if (!linked.isFile() || linked.isSymbolicLink() || target.isSymbolicLink() || !equal(identity(linked), identity(file)) || !equal(identity(target), identity(file)) || linked.size !== file.size || linked.mtimeMs !== file.mtimeMs || await hashFile(from, linked) !== file.hash) throw changed();
-      await checkFolders();
-      if (!equal(metadata(await lstat(from)), metadata(linked))) throw changed();
-      await unlink(from);
-      receipt.needsReview.pop(); receipt.completed.push(move); receipt.notMoved.shift();
-    }
-    return receipt.completed;
-  } catch (error) {
-    receipt.notMoved = plan.moves.filter(m => !receipt.completed.includes(m) && !receipt.needsReview.includes(m));
-    error.receipt = receipt;
-    throw error;
-  }
-}
+export async function snapshot(root, options) { return prepareInventory(await scanFolder(path.join(root, 'Inbox'), options)); }
+export { planSchema, validatePlan, allocatePlan, executePlan } from './organization.js';

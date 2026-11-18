@@ -90,3 +90,6 @@ Global scrollbar tokens: thumb #a6b9af, track #eef2ef, hover #7b9789, active #50
 - Do preserve raw file names and permission scopes.
 - Don't imply calendar or email are connected.
 - Don't invent progress percentages or replay entry motion on streamed tokens.
+
+
+Recursive review extension (2026-11-12): reuse the existing panel, button, status, and type tokens. Category groups contain source/destination cards with native action radios and labelled category/name inputs. Two edit columns collapse to one at 650px. Review lists and transfer receipts scroll within bounded surfaces; exact paths wrap. The scope checkbox uses the same native checked/disabled semantics as the motion preference.

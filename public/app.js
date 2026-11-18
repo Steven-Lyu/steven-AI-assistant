@@ -15,17 +15,17 @@ const paths = {
 };
 const icon = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[name] || paths.file}"/></svg>`;
 document.querySelectorAll('[data-icon]').forEach(el => el.innerHTML = icon(el.dataset.icon));
-const labels = { submitted:'Getting ready', running:'Thinking', waiting_approval:'Permission needed', waiting_confirmation:'Ready to review', executing:'Organizing', completed:'Completed', failed:'Needs attention', cancelled:'Cancelled' };
+const labels = { submitted:'Getting ready', running:'Thinking', waiting_approval:'Permission needed', waiting_confirmation:'Ready to review', executing:'Organizing', completed:'Completed', failed:'Needs attention', cancelled:'Cancelled', cancelling:'Cancelling', updating_plan:'Updating preview' };
 const terminal = ['completed','failed','cancelled'];
 let token, tasks = [], selected, submitting = false, actionPending = false, connected = false, lastKey = '', lastTaskState = '', historyLimit = 5;
-let organizeTaskId = null;
+let organizeTaskId = null, planDirty = false;
 let sourceMode = 'folder', folder = null, folderPending = false, folderStale = false;
 const staleTasks = new Set();
 const animatedCompletions = new Set();
 function transferScene(task, animate = false) {
   const done = task.status === 'completed';
   const groups = new Map();
-  for (const move of task.plan.moves) {
+  for (const move of task.plan.moves.filter(m=>m.action==='move')) {
     if (!groups.has(move.category)) groups.set(move.category, []);
     groups.get(move.category).push(move);
   }
@@ -38,12 +38,21 @@ const time = value => new Intl.DateTimeFormat('en-GB',{hour:'2-digit',minute:'2-
 const empty = () => `<div class="empty"><div class="file-scene" aria-hidden="true"><span class="paper">${icon('file')}</span><span class="paper">${icon('file')}</span><span class="paper">${icon('file')}</span></div><h3>A fresh start for your files.</h3><p>Make a plan. Review it. Let things fall into place.</p><div class="empty-steps"><span>Plan</span>${icon('arrow')}<span>Review</span>${icon('arrow')}<span>Organize</span></div></div>`;
 function updateControls() {
   const active = tasks.some(t => !terminal.includes(t.status));
-  $('#start').disabled = submitting || folderPending || !connected || !token || active || (sourceMode === 'folder' && (!folder?.files.length || folderStale));
+  $('#start').disabled = submitting || folderPending || !connected || !token || active || (sourceMode === 'folder' && (!folder?.files.length || !folder.complete || folder.recoveries?.some(r=>r.needsReview.length) || folderStale || folder.firstLevelOnly!==$('#first-level-only').checked));
   for (const id of ['browse','rescan','use-sample']) $(`#${id}`).disabled = submitting || folderPending || active || !connected || !token;
+  $('#first-level-only').disabled=submitting||folderPending||active||!connected;
+  $('#cancel-scan').hidden=!folderPending;$('#cancel-scan').disabled=!connected||!folderPending;
+  $('#scan-progress').hidden=!folderPending;
   $('#browse').textContent = folderPending ? 'Selecting…' : 'Browse';
   $('#browse').setAttribute('aria-busy', String(folderPending));
   $('#start').setAttribute('aria-busy', String(submitting));
+  const current = tasks.find(t=>t.id===selected) || tasks[0];
+  const cancelButton=$('#cancel-task');
+  cancelButton.hidden=!current || terminal.includes(current.status) || ['executing','cancelling'].includes(current.status);
+  if(cancelButton.hidden && document.activeElement===cancelButton){$('#task-heading').tabIndex=-1;$('#task-heading').focus({preventScroll:true});}
   document.querySelectorAll('[data-action], [data-approval]').forEach(b => b.disabled = !connected || actionPending || b.dataset.answered === 'true');
+  const confirm=$('#confirm-task');if(confirm)confirm.disabled ||= planDirty || current?.plan?.counts.review>0 || current?.plan?.counts.blocked>0;
+  document.querySelectorAll('.plan-editor input').forEach(el=>el.disabled=!connected||actionPending);
 }
 async function api(route, data = {}, timeout = 65000) {
   const controller = new AbortController();
@@ -61,30 +70,40 @@ function renderSource() {
   const sample = sourceMode === 'sample';
   $('#source-tag').textContent = sample ? 'SAMPLE' : 'LOCAL FILES';
   $('#source-name').textContent = sample ? 'Sample inbox' : folder ? folder.root.split(/[\\/]/).filter(Boolean).at(-1) : 'Choose a folder';
-  $('#source-summary').textContent = sample ? '6 files · A fresh set for every task' : folder ? `${folder.files.length} files · ${formatSize(folder.files.reduce((total,f)=>total+f.size,0))} · ${folder.skipped.length} skipped` : 'Files in this folder only · Up to 200 files';
+  $('#source-summary').textContent = sample ? `${$('#first-level-only').checked?'6 files':'8 files, including 2 nested examples'} · A fresh set for every task` : folder ? `${folder.files.length} files · ${formatSize(folder.files.reduce((total,f)=>total+f.size,0))} · ${folder.skipped.length} skipped` : `${$('#first-level-only').checked?'First-level files':'Including subfolders'} · Up to 200 files`;
   $('#source-path').hidden = sample || !folder; $('#source-path').textContent = folder?.root || '';
   $('#rescan').hidden = sample || !folder;
   $('#use-sample').hidden = sample;
-  $('#source-status').textContent = folderPending ? 'Choose a folder in the Windows window. Scanning follows your selection.' : sample ? 'Sample files stay separate from your folders.' : folderStale ? 'Folder contents may have changed. Rescan before making another plan.' : folder ? folder.files.length ? 'First-level files only. Category folders will be created here.' : 'No eligible files. Choose another folder or rescan.' : 'Choose a folder to preview its files.';
+  $('#source-status').textContent = folderPending ? 'Choose a folder in the Windows window. Scanning follows your selection.' : sample ? 'Sample files stay separate from your folders.' : folderStale ? 'Folder contents may have changed. Rescan before making another plan.' : folder ? folder.files.length ? `${folder.firstLevelOnly?'First-level files only.':'Including subfolders.'} Output: Organized/category. ${folder.complete?'':'Scan incomplete — choose a smaller accessible folder.'}` : 'No files need organizing in this scope.' : 'Choose a folder to preview its files.';
   $('#source-preview').hidden = sample || !folder;
   $('#preview-summary').textContent = `Preview ${folder?.files.length || 0} files · ${folder?.skipped.length || 0} skipped`;
-  $('#source-files').innerHTML = folder ? folder.files.map(f=>`<div class="inventory-row">${icon('file')}<span>${escape(f.name)}</span><small>${formatSize(f.size)}</small></div>`).join('') + folder.skipped.map(f=>`<div class="inventory-row skipped">${icon('folder')}<span>${escape(f.name)}</span><small>${escape(f.reason)}</small></div>`).join('') : '';
-  $('#input-help').textContent = sample ? 'Only generated sample files are used.' : 'Names and sizes go to Codex. Contents stay local.';
+  $('#source-files').innerHTML = folder ? folder.files.map(f=>`<div class="inventory-row">${icon('file')}<span>${escape(f.relativePath || f.name)}</span><small>${formatSize(f.size)}</small></div>`).join('') + folder.skipped.map(f=>`<div class="inventory-row skipped">${icon('folder')}<span>${escape(f.relativePath || f.name)}</span><small>${escape(f.reason)}</small></div>`).join('') : '';
+  if(folder){$('#source-files').innerHTML += (folder.unscanned||[]).map(f=>`<div class="inventory-row skipped"><span>${escape(f.relativePath)}</span><small>Not scanned: ${escape(f.reason)}</small></div>`).join('') + (folder.recoveries||[]).map(r=>`<details class="details" open><summary>Recovered execution: ${r.completed.length} moved · ${r.notMoved.length} not moved · ${r.needsReview.length} need checking</summary>${[['Moved',r.completed],['Not moved',r.notMoved],['Check both locations',r.needsReview]].map(([label,items])=>items.map(m=>`<p class="path">${label}: ${escape(m.relativePath)} → ${escape(m.targetRelativePath)}</p>`).join('')).join('')}</details>`).join('');}
+  if(folder&&!folder.complete)$('#source-status').textContent='Scan incomplete. Review unscanned locations below, then choose a smaller accessible folder.';
+  if(folder?.recoveries?.some(r=>r.needsReview.length))$('#source-status').textContent='An interrupted move needs review. Check the recovery report below before planning.';
+  $('#input-help').textContent = sample ? 'Only generated sample files are used.' : 'Paths, names and sizes go to Codex. Contents stay local.';
   updateControls();
 }
 async function selectFolder(rescan = false) {
   if (folderPending) return;
+  if(rescan)folderStale=true;
   folderPending = true; $('#source-error').hidden = true; renderSource();
   try {
-    const result = await api(rescan ? '/api/folders/rescan' : '/api/folders/browse', rescan ? { selectionId: folder.id } : {}, 135000);
+    const result = await api(rescan ? '/api/folders/rescan' : '/api/folders/browse', { ...(rescan ? { selectionId: folder.id } : {}), firstLevelOnly:$('#first-level-only').checked }, 135000);
+    if (result.cancelled && rescan) folder=null;
     if (!result.cancelled) { folder=result; sourceMode='folder'; folderStale=false; }
-  } catch(e) { $('#source-error').textContent=e.message; $('#source-error').hidden=false; if(rescan)folderStale=true; }
+  } catch(e) { $('#source-error').textContent=e.message; $('#source-error').hidden=false; if(rescan){folderStale=true;folder=null;} }
   finally { folderPending=false; renderSource(); $('#browse').focus({preventScroll:true}); }
 }
+$('#first-level-only').addEventListener('change',()=>{if(folder && sourceMode==='folder')selectFolder(true);else renderSource();});
+$('#cancel-scan').addEventListener('click',async()=>{try{await api('/api/folders/cancel');}catch(e){$('#source-error').textContent=e.message;$('#source-error').hidden=false;}});
+setInterval(async()=>{if(!folderPending)return;try{const response=await fetch('/api/folders/progress');const data=await response.json();if(folderPending)$('#scan-progress').textContent=data.progress?.phase==='scanning'?`Scanning: ${data.progress.files||0} files · ${data.progress.directories||0} folders`:'Waiting for folder selection…';}catch{}},700);
 $('#browse').addEventListener('click',()=>selectFolder());
 $('#rescan').addEventListener('click',()=>selectFolder(true));
 $('#use-sample').addEventListener('click',()=>{sourceMode='sample';$('#source-error').hidden=true;renderSource();$('#instruction').focus();});
 function render() {
+  const activeScope=tasks.find(t=>!terminal.includes(t.status));
+  if(activeScope && $('#first-level-only').checked!==activeScope.firstLevelOnly){$('#first-level-only').checked=activeScope.firstLevelOnly;renderSource();}
   for (const t of tasks) if (t.sourceMode==='folder' && terminal.includes(t.status) && !staleTasks.has(t.id)) {
     staleTasks.add(t.id);
     if(folder?.root===t.root) { folderStale=true; renderSource(); }
@@ -99,18 +118,24 @@ function render() {
   selected = task.id;
   $('#status').textContent = labels[task.status]; $('#status').className = `status ${task.status}`;
   // Streaming deltas do not rebuild the task UI. Preserve focus, disclosures and animations.
-  const key = JSON.stringify([task.id,task.status,task.plan,task.result,task.approvals,task.events,task.error]);
+  const key = JSON.stringify([task.id,task.status,task.plan,task.result,task.approvals,task.events,task.error,task.phase,task.progress,connected]);
   if (key === lastKey) { updateControls(); return; }
   lastKey = key;
   const openDetails = new Set([...document.querySelectorAll('#task-content details[open]')].map(d => d.id));
   const focused = document.activeElement?.id;
   const stateChanged = lastTaskState !== `${task.id}:${task.status}`;
   lastTaskState = `${task.id}:${task.status}`;
-  let content = `<div class="task-title"><strong>${escape(task.title)}</strong><small>${time(task.createdAt)}</small></div><ol class="steps" aria-label="Task progress">${['Submitted','Planning','Review','Organized'].map((label,i) => {
+  let content = `<div class="task-title"><strong>${escape(task.title)}</strong><small>${task.firstLevelOnly?'First level':'Including subfolders'} · ${time(task.createdAt)}</small></div><ol class="steps" aria-label="Task progress">${['Submitted','Planning','Review','Organized'].map((label,i) => {
     const step = task.status === 'completed' ? 4 : task.plan ? 2 : ['running','waiting_approval'].includes(task.status) ? 1 : 0;
     return `<li class="${i<step?'done':i===step&&!terminal.includes(task.status)?'current':''}" ${i===step?'aria-current="step"':''}>${label}</li>`;
   }).join('')}</ol>`;
-  if (['submitted','running'].includes(task.status)) content += `<div class="activity"><span class="spinner" aria-hidden="true"></span><div><strong>Finding a place for each file…</strong><p>Your assistant is working on the plan.</p></div></div><div class="running-files" aria-hidden="true"><span>${icon('file')}</span><span>${icon('file')}</span><span>${icon('file')}</span></div>`;
+  if (['submitted','running','cancelling'].includes(task.status)) {
+    const stages = { checking: 'Checking your files…', connecting: 'Connecting to Codex…', starting: 'Starting the assistant…', planning: 'Finding a place for each file…', destinations: 'Preparing final destinations…', retrying: 'Reconnecting to the model…' };
+    const stage = !connected ? 'Waiting for the local service…' : task.status==='cancelling' ? 'Cancelling your task…' : stages[task.phase] || 'Preparing your task…';
+    const detail = !connected ? 'Task status is unavailable until the connection returns.' : task.status==='cancelling' ? 'Stopping the assistant. No organizing plan will be applied.' : task.phase==='checking' ? `${task.progress?.completed || 0} of ${task.progress?.total || task.files.length} files checked locally.` : task.phase==='retrying' ? task.notice : 'You can cancel while the assistant is working.';
+    content += `<div class="activity">${connected?'<span class="spinner" aria-hidden="true"></span>':''}<div><strong>${escape(stage)}</strong><p>${escape(detail)}</p><small class="task-elapsed" data-started="${escape(task.createdAt)}"></small></div></div>`;
+    if(connected && task.phase==='planning' && task.status==='running') content += `<div class="running-files" aria-hidden="true"><span>${icon('file')}</span><span>${icon('file')}</span><span>${icon('file')}</span></div>`;
+  }
   for (const a of task.approvals) {
     const p = a.params;
     content += `<section class="approval" aria-labelledby="approval-title-${escape(a.id)}"><p class="eyebrow">CODEX PERMISSION</p><h3 id="approval-title-${escape(a.id)}">${a.method.includes('commandExecution')?'Run a command?':a.method.includes('fileChange')?'Allow file changes?':'Allow additional access?'}</h3><p>${escape(p.reason || 'Review this operation before granting permission.')}</p><p class="scope"><strong>Scope:</strong> ${escape(p.cwd || p.grantRoot || task.root)} · This request only</p><pre>${escape(JSON.stringify({command:p.command || a.item?.command,changes:a.item?.changes,permissions:p.permissions,additionalPermissions:p.additionalPermissions,network:p.networkApprovalContext,grantRoot:p.grantRoot},null,2))}</pre><p>File organizing still needs your separate approval.</p><div class="actions"><button id="deny-${escape(a.id)}" class="button secondary" data-approval="${escape(a.id)}" data-allow="false" data-answered="${a.answered}">Decline</button><button id="allow-${escape(a.id)}" class="button primary" data-approval="${escape(a.id)}" data-allow="true" data-answered="${a.answered}">${a.answered?'Decision sent':'Allow once'}</button></div></section>`;
@@ -119,19 +144,19 @@ function render() {
     const transferred = ['executing','completed'].includes(task.status);
     const animateTransfer = stateChanged && task.status === 'completed' && organizeTaskId === task.id && !animatedCompletions.has(task.id);
     if (animateTransfer) animatedCompletions.add(task.id);
-    if (transferred) content += transferScene(task, animateTransfer);
+    if (transferred && task.plan.counts.move) content += transferScene(task, animateTransfer);
     if (transferred) content += '<details id="moved-file-details" class="details"><summary>View files & destinations</summary>';
-    content += `<div class="plan-heading"><h3>${task.status==='completed'?'Everything in its place.':'A place for every file.'}</h3><span>${task.plan.moves.length} files</span></div><div class="file-list ${task.status==='completed'&&stateChanged?'settle':''}">${task.plan.moves.map(m => `<div class="file-card"><span class="file-icon">${icon('file')}</span><div><strong>${escape(m.name)}</strong><small>${task.status==='completed'?'Organized':escape(task.sourceRoot || 'Sample inbox')}</small></div><span class="file-destination">${icon(task.status==='completed'?'check':'arrow')}${escape(m.category)}</span></div>`).join('')}</div><details id="reason-details" class="details"><summary>Why these folders?</summary><ul class="reason-list">${task.plan.moves.map(m => `<li><strong>${escape(m.name)}</strong>${escape(m.reason)}</li>`).join('')}</ul></details>`;
+    if(stateChanged)planDirty=false;
+    content += reviewPlan(task);
     if (transferred) content += '</details>';
-    if (task.status === 'waiting_confirmation') content += `<div class="business-confirm"><strong>Move ${task.plan.moves.length} files to these folders?</strong><p>Names and contents stay the same. Destinations are inside:</p><p class="path">${escape(task.root)}</p><button id="confirm-task" class="button primary" data-action="confirm">Approve & organize ${icon('arrow')}</button></div>`;
+    if (task.status === 'waiting_confirmation') content += `<div class="business-confirm"><strong>${task.plan.counts.move ? `Move ${task.plan.counts.move} files to these folders?` : 'No files selected to move.'}</strong><p>${task.plan.counts.renamed} renamed · Contents stay the same.</p><p class="path">${escape(task.root)}/Organized</p><p id="plan-edit-status" role="status">${task.plan.counts.review||task.plan.counts.blocked?'Resolve or exclude items needing review before approval.':'Review the final paths before approving.'}</p><button class="button secondary" data-action="revise">Update preview</button><button id="confirm-task" class="button primary" data-action="confirm">${task.plan.counts.move?'Approve & organize':'Finish without moving'} ${icon('arrow')}</button></div>`;
   }
-  if (task.receipt) content += `<section class="move-receipt"><h3>Move report</h3><p>${task.receipt.completed.length} moved · ${task.receipt.notMoved.length} not moved · ${task.receipt.needsReview.length} need checking</p>${[['Moved',task.receipt.completed],['Not moved',task.receipt.notMoved],['Check both locations',task.receipt.needsReview]].map(([label,items])=>items.length?`<details class="details" open><summary>${label}</summary><ul>${items.map(m=>`<li>${escape(m.name)} → ${escape(m.category)}</li>`).join('')}</ul></details>`:'').join('')}</section>`;
+  if (task.receipt) content += `<section class="move-receipt"><h3>Move report</h3><p>${task.receipt.completed.length} moved · ${task.receipt.notMoved.length} not moved · ${task.receipt.needsReview.length} need checking</p>${[['Moved',task.receipt.completed],['Not moved',task.receipt.notMoved],['Check both locations',task.receipt.needsReview]].map(([label,items])=>items.length?`<details class="details" open><summary>${label}</summary><ul>${items.map(m=>`<li>${escape(m.relativePath)} → ${escape(m.targetRelativePath)}</li>`).join('')}</ul></details>`:'').join('')}</section>`;
   if (task.status==='failed') {
     const limited = /usage limit|quota|rate limit/i.test(task.error || '');
     content += `<div class="error"><h3>${limited?'Usage limit reached.':'This task needs another try.'}</h3><p>${escape(task.error)}</p><p>${limited?'Try again when your Codex usage is available.':task.receipt?'Review the move report, then rescan the folder. Completed moves have been kept.':'Rescan your folder or choose it again, then make a new plan.'}</p><button class="button secondary" data-retry>${task.sourceMode==='folder'?'Choose files':'Try again'}</button></div>`;
   }
   if (task.status==='cancelled') content += '<div class="activity">Task cancelled. No organizing plan was applied.</div>';
-  if (!terminal.includes(task.status)&&task.status!=='executing') content += '<button id="cancel-task" class="button ghost" data-action="cancel">Cancel task</button>';
   content += `<details id="activity-details" class="details"><summary>Activity & file location</summary><p class="path">${escape(task.root)}</p><ul>${task.events.map(e => `<li><time>${time(e.time)}</time>${escape(e.message)}</li>`).join('')}</ul></details>`;
   $('#task-content').innerHTML = content;
   if (stateChanged && organizeTaskId === task.id && ['executing','completed'].includes(task.status)) {
@@ -148,7 +173,7 @@ async function start() {
   $('#form-error').textContent=''; $('#instruction').removeAttribute('aria-invalid');
   if (!$('#instruction').value.trim()) { $('#form-error').textContent='Add an organizing preference to start.'; $('#instruction').setAttribute('aria-invalid','true'); $('#instruction').focus(); return; }
   submitting=true; updateControls();
-  try { const t=await api('/api/tasks',{instruction:$('#instruction').value,sourceMode,selectionId:sourceMode==='folder'?folder?.id:undefined}); selected=t.id; tasks=[t,...tasks.filter(item=>item.id!==t.id)]; render(); }
+  try { const t=await api('/api/tasks',{instruction:$('#instruction').value,sourceMode,firstLevelOnly:$('#first-level-only').checked,selectionId:sourceMode==='folder'?folder?.id:undefined}); selected=t.id; tasks=[t,...tasks.filter(item=>item.id!==t.id)]; render(); }
   catch(e) { $('#form-error').textContent=e.message; }
   finally { submitting=false; updateControls(); }
 }
@@ -175,12 +200,14 @@ document.addEventListener('click',async event=>{
   if('retry' in b.dataset){ if(tasks.find(t=>t.id===selected)?.sourceMode==='folder')return $('#browse').focus(); sourceMode='sample';renderSource();return start(); }
   if(b.dataset.action||b.dataset.approval){
     if(actionPending)return;actionPending=true;updateControls();$('#action-error').hidden=true;
-    if(b.dataset.action==='confirm') organizeTaskId=selected;
+    const actionTaskId=selected;
+    if(b.dataset.action==='cancel'){b.textContent='Cancelling…';b.setAttribute('aria-busy','true');}
+    if(b.dataset.action==='confirm') organizeTaskId=actionTaskId;
     try{
       if(b.dataset.approval){const a=tasks.find(t=>t.id===selected)?.approvals.find(a=>String(a.id)===b.dataset.approval);if(!a)throw new Error('This permission request has expired.');await api(`/api/tasks/${selected}/approval`,{requestId:a.id,allow:b.dataset.allow==='true'});}
-      else await api(`/api/tasks/${selected}/${b.dataset.action}`);
+      else { const task=tasks.find(t=>t.id===actionTaskId);const payload={revision:task.plan?.revision};if(b.dataset.action==='revise')payload.changes=collectPlanEdits();const response=await api(`/api/tasks/${actionTaskId}/${b.dataset.action}`,payload);planDirty=false; if(response.task){ tasks=tasks.map(t=>t.id===response.task.id?response.task:t); render(); } }
     }catch(e){$('#action-error').textContent=e.message;$('#action-error').hidden=false;}
-    finally{actionPending=false;updateControls();}
+    finally{actionPending=false;updateControls();const cancel=$('#cancel-task');if(cancel){cancel.textContent='Cancel task';cancel.removeAttribute('aria-busy');}}
   }
 });
 function autoGrow(){const input=$('#instruction');input.style.height='auto';input.style.height=`${Math.min(input.scrollHeight,320)}px`;$('#char-count').textContent=`${input.value.length} / 2000`;}
@@ -195,4 +222,15 @@ renderSource();render();
 const events=new EventSource('/api/events');
 events.onopen=()=>sync().catch(()=>{connected=false;updateControls();});
 events.onmessage=e=>{++syncId;tasks=JSON.parse(e.data);render();if(!connected||!token)sync().catch(()=>{});};
-events.onerror=()=>{connected=false;$('#connection').textContent='Reconnecting';$('#connection').classList.remove('online');$('#connection-error').hidden=false;updateControls();};
+events.onerror=()=>{connected=false;$('#connection').textContent='Reconnecting';$('#connection').classList.remove('online');$('#connection-error').hidden=false;render();};
+
+setInterval(()=>{document.querySelectorAll('[data-started]').forEach(el=>{const seconds=Math.max(0,Math.floor((Date.now()-Date.parse(el.dataset.started))/1000));el.textContent=`Elapsed ${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`;});},1000);
+
+function reviewPlan(task) {
+  const editable=task.status==='waiting_confirmation',groups=new Map();
+  task.plan.moves.forEach((m,i)=>{const key=m.action==='keep'?'Keep in place':m.category||'Needs a category';if(!groups.has(key))groups.set(key,[]);groups.get(key).push({m,i});});
+  const counts=task.plan.counts;
+  return `<div class="plan-heading"><h3>${task.status==='completed'?(task.result?.length?'Files organized.':'No files moved.'):'Review your destinations.'}</h3></div><p class="plan-counts">${counts.move} to move · ${counts.renamed} renamed · ${counts.keep} kept · ${counts.review} to review · ${task.skipped?.length||0} skipped</p><div class="file-list plan-list">${[...groups].map(([category,items])=>`<section class="plan-group"><h4>${escape(category)}</h4>${items.map(({m,i})=>`<article class="plan-item ${editable?'plan-editor':''}" data-move-index="${i}"><strong>${escape(m.relativePath)}</strong><p class="path">${m.action==='move'?`→ ${escape(task.root)}/${escape(m.targetRelativePath||'Destination needs attention')}`:m.action==='keep'?'Stays in its current folder':'Needs your decision'}</p><p>${escape(m.reason)} <span class="assessment">${{reuse:'Existing category fits',reclassify:'Reclassified',uncertain:'Uncertain'}[m.assessment]}</span></p>${m.renamed?`<p class="rename-note">${escape(m.name)} → ${escape(m.targetName)} · ${escape(m.renameReason)}</p>`:''}${m.blocker?`<p class="inline-error" role="alert">${escape(m.blocker)}</p>`:''}${editable?`<fieldset><legend>Action for ${escape(m.relativePath)}</legend>${['move','keep','review'].map(a=>`<label><input type="radio" name="action-${i}" value="${a}" ${m.action===a?'checked':''}>${{move:'Move',keep:'Keep',review:'Review'}[a]}</label>`).join('')}</fieldset><div class="plan-fields"><label for="category-${i}">Category<input id="category-${i}" data-category value="${escape(m.category)}" maxlength="255"></label><label for="target-${i}">Target name (optional)<input id="target-${i}" data-target-name value="${escape(m.requestedName||'')}" placeholder="Automatic" maxlength="255"></label></div>`:''}</article>`).join('')}</section>`).join('')}</div>${task.skipped?.length?`<details class="details"><summary>${task.skipped.length} skipped items</summary>${task.skipped.map(f=>`<p>${escape(f.relativePath||f.name)} — ${escape(f.reason)}</p>`).join('')}</details>`:''}`;
+}
+function collectPlanEdits(){const task=tasks.find(t=>t.id===selected);return [...document.querySelectorAll('.plan-editor')].map(el=>({relativePath:task.plan.moves[Number(el.dataset.moveIndex)].relativePath,action:el.querySelector('input[type=radio]:checked').value,category:el.querySelector('[data-category]').value.trim(),requestedName:el.querySelector('[data-target-name]').value}));}
+document.addEventListener('input',e=>{if(e.target.closest('.plan-editor')){planDirty=true;const status=$('#plan-edit-status');if(status)status.textContent='Changes not applied. Update preview to recalculate destinations.';updateControls();}});

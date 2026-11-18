@@ -21,6 +21,7 @@ const server = http.createServer(async (req, res) => {
     if (req.headers.origin && ![origin, `http://localhost:${port}`].includes(req.headers.origin)) return json(res, 403, { error: 'Cross-site request denied' });
     const url = new URL(req.url, origin);
     if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, { token, tasks: service.list() });
+    if (req.method === 'GET' && url.pathname === '/api/folders/progress') return json(res,200,{busy:folders.busy,progress:folders.progress});
     if (req.method === 'GET' && url.pathname === '/api/events') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       streams.add(res); res.write(`data: ${JSON.stringify(service.list())}\n\n`);
@@ -29,32 +30,36 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
       if (req.headers['x-assistant-token'] !== token) return json(res, 403, { error: 'Session expired. Refresh this page' });
-      let raw = ''; for await (const chunk of req) { raw += chunk; if (raw.length > 16000) throw new Error('Request too long'); }
+      let raw = ''; for await (const chunk of req) { raw += chunk; if (raw.length > 250000) throw new Error('Request too long'); }
       const body = JSON.parse(raw || '{}');
+      if (url.pathname === '/api/folders/cancel') {folders.close();return json(res,200,{ok:true});}
+      if(url.pathname.startsWith('/api/folders/') && service.list().some(t=>!['completed','failed','cancelled'].includes(t.status))) throw new Error('Finish or cancel your current task before changing scope.');
+      if(body.firstLevelOnly!==undefined && typeof body.firstLevelOnly!=='boolean')throw new Error('Invalid scanning scope');
       if (url.pathname === '/api/folders/browse') {
         const controller = new AbortController();
         const abort = () => { if (!res.writableEnded) controller.abort(); };
         res.on('close', abort);
-        try { return json(res, 200, await folders.browse(controller.signal)); }
+        try { return json(res, 200, await folders.browse(controller.signal,body.firstLevelOnly??true)); }
         finally { res.off('close', abort); }
       }
-      if (url.pathname === '/api/folders/rescan') return json(res, 200, await folders.rescan(body.selectionId));
+      if (url.pathname === '/api/folders/rescan') return json(res, 200, await folders.rescan(body.selectionId,body.firstLevelOnly??true));
       if (url.pathname === '/api/tasks') {
         if (typeof body.instruction !== 'string' || body.instruction.length > 2000) throw new Error('Enter a preference of up to 2000 characters');
-        return json(res, 201, await service.create(body.instruction, body.sourceMode === 'sample' ? null : folders.get(body.selectionId)));
+        return json(res, 201, await service.create(body.instruction, body.sourceMode === 'sample' ? null : folders.get(body.selectionId),body.firstLevelOnly??true));
       }
-      const match = url.pathname.match(/^\/api\/tasks\/([^/]+)\/(confirm|cancel|approval)$/);
+      const match = url.pathname.match(/^\/api\/tasks\/([^/]+)\/(confirm|cancel|approval|revise)$/);
       if (match) {
         if (match[2] === 'approval') { if (typeof body.allow !== 'boolean') throw new Error('Invalid decision'); service.approve(match[1], body.requestId, body.allow); }
-        else await service[match[2]](match[1]);
-        return json(res, 200, { ok: true });
+        else if(match[2]==='revise')await service.revise(match[1],body.revision,body.changes);
+        else await service[match[2]](match[1],body.revision);
+        return json(res, 200, { ok: true, task: service.view(service.get(match[1])) });
       }
       return json(res, 404, { error: 'Endpoint not found' });
     }
     const staticFiles = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
     const entry = staticFiles[url.pathname];
     if (req.method !== 'GET' || !entry) return json(res, 404, { error: 'Page not found' });
-    res.writeHead(200, { 'Content-Type': entry[1] + '; charset=utf-8', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff' });
+    res.writeHead(200, { 'Content-Type': entry[1] + '; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff' });
     res.end(await readFile(path.join(root, 'public', entry[0])));
   } catch (e) { json(res, 400, { error: e.message }); }
 });
